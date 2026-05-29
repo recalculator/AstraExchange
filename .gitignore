@@ -1,0 +1,6 @@
+build/
+*.o
+*.a
+*.dylib
+benchmark-results.csv
+.DS_Store
