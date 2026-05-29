@@ -31,6 +31,8 @@ std::optional<std::shared_ptr<Order>> CsvParser::parseLine(const std::string& li
         if (fields[4] == "LIMIT")        type = OrderType::LIMIT;
         else if (fields[4] == "MARKET")  type = OrderType::MARKET;
         else if (fields[4] == "CANCEL")  type = OrderType::CANCEL;
+        else if (fields[4] == "IOC")     type = OrderType::IOC;
+        else if (fields[4] == "FOK")     type = OrderType::FOK;
         else return std::nullopt;
 
         Price    price = toFixedPrice(std::stod(fields[5]));

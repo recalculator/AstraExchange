@@ -13,10 +13,13 @@ struct GeneratorConfig {
     std::vector<Symbol>  symbols     = {"AAPL", "MSFT", "NVDA", "TSLA"};
     uint32_t             seed        = 42;
 
-    // Order type mix (must sum to 1.0)
-    double fracLimit  = 0.60;
-    double fracMarket = 0.20;
-    double fracCancel = 0.15;
+    // Order type mix. Must sum to 1.0.
+    // fracIoc and fracFok are carved out of fracLimit's share when non-zero.
+    double fracLimit   = 0.55;
+    double fracMarket  = 0.20;
+    double fracCancel  = 0.15;
+    double fracIoc     = 0.03;
+    double fracFok     = 0.02;
     double fracInvalid = 0.05;
 
     // Price distribution per symbol — mid price and half-spread in cents
@@ -59,6 +62,8 @@ private:
     std::shared_ptr<Order> makeLimit(const Symbol& sym, Timestamp ts);
     std::shared_ptr<Order> makeMarket(const Symbol& sym, Timestamp ts);
     std::shared_ptr<Order> makeCancel(Timestamp ts);
+    std::shared_ptr<Order> makeIoc(const Symbol& sym, Timestamp ts);
+    std::shared_ptr<Order> makeFok(const Symbol& sym, Timestamp ts);
     std::shared_ptr<Order> makeInvalid(const Symbol& sym, Timestamp ts);
 };
 

@@ -25,10 +25,12 @@ std::vector<std::shared_ptr<Order>> OrderGenerator::generate() {
         orders.push_back(std::move(o));
     }
 
-    // Thresholds for order type selection
+    // Thresholds for order type selection (cumulative)
     const double tLimit  = cfg_.fracLimit;
-    const double tMarket = tLimit + cfg_.fracMarket;
+    const double tMarket = tLimit  + cfg_.fracMarket;
     const double tCancel = tMarket + cfg_.fracCancel;
+    const double tIoc    = tCancel + cfg_.fracIoc;
+    const double tFok    = tIoc    + cfg_.fracFok;
     // remainder → invalid
 
     std::uniform_real_distribution<double> typeDist(0.0, 1.0);
@@ -56,6 +58,10 @@ std::vector<std::shared_ptr<Order>> OrderGenerator::generate() {
                 o = makeLimit(sym, ts);
                 restingOrders_.emplace_back(sym, o->id);
             }
+        } else if (r < tIoc) {
+            o = makeIoc(sym, ts);
+        } else if (r < tFok) {
+            o = makeFok(sym, ts);
         } else {
             o = makeInvalid(sym, ts);
         }
@@ -124,6 +130,44 @@ std::shared_ptr<Order> OrderGenerator::makeCancel(Timestamp ts) {
     // Side is BUY as placeholder (engine uses symbol+id for lookup).
     return std::make_shared<Order>(cancelId, sym, Side::BUY, OrderType::CANCEL,
                                    0, 1, ts);
+}
+
+std::shared_ptr<Order> OrderGenerator::makeIoc(const Symbol& sym, Timestamp ts) {
+    // IOC: aggressive limit price (crosses the spread) with moderate qty.
+    auto params = defaultSymbolParams(sym);
+    std::bernoulli_distribution sideDist(0.5);
+    Side side = sideDist(rng_) ? Side::BUY : Side::SELL;
+
+    // Use an aggressive price so it has a chance to fill.
+    std::uniform_real_distribution<double> aggrDist(0.0, params.halfSpread * 3);
+    double aggrOffset = aggrDist(rng_);
+    double rawPrice = (side == Side::BUY) ? params.midPrice + aggrOffset
+                                          : params.midPrice - aggrOffset;
+    rawPrice = std::round(rawPrice / params.tickSize) * params.tickSize;
+    if (rawPrice <= 0.0) rawPrice = params.tickSize;
+
+    std::uniform_int_distribution<Quantity> qtyDist(1, 150);
+    return std::make_shared<Order>(nextId(), sym, side, OrderType::IOC,
+                                   toFixedPrice(rawPrice), qtyDist(rng_), ts);
+}
+
+std::shared_ptr<Order> OrderGenerator::makeFok(const Symbol& sym, Timestamp ts) {
+    // FOK: moderate qty, aggressive price. Will succeed when liquidity is present.
+    auto params = defaultSymbolParams(sym);
+    std::bernoulli_distribution sideDist(0.5);
+    Side side = sideDist(rng_) ? Side::BUY : Side::SELL;
+
+    std::uniform_real_distribution<double> aggrDist(0.0, params.halfSpread * 2);
+    double aggrOffset = aggrDist(rng_);
+    double rawPrice = (side == Side::BUY) ? params.midPrice + aggrOffset
+                                          : params.midPrice - aggrOffset;
+    rawPrice = std::round(rawPrice / params.tickSize) * params.tickSize;
+    if (rawPrice <= 0.0) rawPrice = params.tickSize;
+
+    // Smaller qty so FOK has a better chance of full fill.
+    std::uniform_int_distribution<Quantity> qtyDist(1, 80);
+    return std::make_shared<Order>(nextId(), sym, side, OrderType::FOK,
+                                   toFixedPrice(rawPrice), qtyDist(rng_), ts);
 }
 
 std::shared_ptr<Order> OrderGenerator::makeInvalid(const Symbol& sym, Timestamp ts) {

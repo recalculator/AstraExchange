@@ -25,6 +25,9 @@ public:
     explicit OrderBook(Symbol symbol);
 
     // Returns trades generated and sets order status on the incoming order.
+    // Returns trades generated and sets order status on the incoming order.
+    // For IOC: fills what it can, cancels the rest (never rests).
+    // For FOK: fills fully or rejects entirely with no trades.
     std::vector<Trade> addOrder(std::shared_ptr<Order> order);
 
     bool cancelOrder(OrderId id);
@@ -62,8 +65,16 @@ private:
 
     std::vector<Trade> matchLimit(std::shared_ptr<Order> incoming);
     std::vector<Trade> matchMarket(std::shared_ptr<Order> incoming);
+    std::vector<Trade> matchIoc(std::shared_ptr<Order> incoming);
+    std::vector<Trade> matchFok(std::shared_ptr<Order> incoming);
 
     Trade makeTrade(const Order& maker, Order& taker, Quantity qty) const;
+
+    // Compute how many units of `incoming` can be filled at acceptable prices
+    // without modifying the book. Used by FOK pre-check.
+    template<typename Map>
+    Quantity availableFill(const Map& side, const Order& incoming,
+                           std::function<bool(Price)> crosses) const;
 
     template<typename Map>
     std::vector<Trade> drainSide(Map& side, std::shared_ptr<Order> incoming,

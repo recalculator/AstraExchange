@@ -9,10 +9,12 @@ OrderBook::OrderBook(Symbol symbol) : symbol_(std::move(symbol)) {}
 std::vector<Trade> OrderBook::addOrder(std::shared_ptr<Order> order) {
     order->status = OrderStatus::ACCEPTED;
 
-    if (order->type == OrderType::MARKET) {
-        return matchMarket(order);
+    switch (order->type) {
+        case OrderType::MARKET: return matchMarket(order);
+        case OrderType::IOC:    return matchIoc(order);
+        case OrderType::FOK:    return matchFok(order);
+        default:                return matchLimit(order);
     }
-    return matchLimit(order);
 }
 
 bool OrderBook::cancelOrder(OrderId id) {
@@ -182,6 +184,75 @@ std::vector<Trade> OrderBook::matchMarket(std::shared_ptr<Order> incoming) {
 
     incoming->status = incoming->isFilled() ? OrderStatus::FILLED
                                              : OrderStatus::PARTIALLY_FILLED;
+    return trades;
+}
+
+// Scan the resting side without touching the book to count fillable qty.
+template<typename Map>
+Quantity OrderBook::availableFill(const Map& restingSide, const Order& incoming,
+                                   std::function<bool(Price)> crosses) const {
+    Quantity available = 0;
+    for (auto& [price, level] : restingSide) {
+        if (crosses && !crosses(price)) break;
+        available += level.totalQty();
+        if (available >= incoming.quantity) break; // early exit — enough
+    }
+    return available;
+}
+
+// IOC: match greedily, cancel any unfilled remainder — never rests.
+std::vector<Trade> OrderBook::matchIoc(std::shared_ptr<Order> incoming) {
+    std::vector<Trade> trades;
+
+    if (incoming->side == Side::BUY) {
+        auto crosses = [&](Price p){ return p <= incoming->price; };
+        trades = drainSide(asks_, incoming, crosses);
+    } else {
+        auto crosses = [&](Price p){ return p >= incoming->price; };
+        trades = drainSide(bids_, incoming, crosses);
+    }
+
+    // Any unfilled remainder is cancelled — never rested.
+    if (incoming->isFilled()) {
+        incoming->status = OrderStatus::FILLED;
+    } else if (incoming->filledQty > 0) {
+        incoming->status = OrderStatus::PARTIALLY_FILLED;
+    } else {
+        // No fill at all — treat as cancelled (no liquidity at limit price)
+        incoming->status = OrderStatus::CANCELLED;
+    }
+
+    return trades;
+}
+
+// FOK: fill fully or not at all. No partial fills, never rests.
+std::vector<Trade> OrderBook::matchFok(std::shared_ptr<Order> incoming) {
+    // Pre-check: can the full qty be filled without executing?
+    bool canFill = false;
+    if (incoming->side == Side::BUY) {
+        auto crosses = [&](Price p){ return p <= incoming->price; };
+        canFill = (availableFill(asks_, *incoming, crosses) >= incoming->quantity);
+    } else {
+        auto crosses = [&](Price p){ return p >= incoming->price; };
+        canFill = (availableFill(bids_, *incoming, crosses) >= incoming->quantity);
+    }
+
+    if (!canFill) {
+        incoming->status = OrderStatus::CANCELLED;
+        return {};
+    }
+
+    // Full qty available — execute exactly like a limit order drain.
+    std::vector<Trade> trades;
+    if (incoming->side == Side::BUY) {
+        auto crosses = [&](Price p){ return p <= incoming->price; };
+        trades = drainSide(asks_, incoming, crosses);
+    } else {
+        auto crosses = [&](Price p){ return p >= incoming->price; };
+        trades = drainSide(bids_, incoming, crosses);
+    }
+
+    incoming->status = OrderStatus::FILLED;
     return trades;
 }
 

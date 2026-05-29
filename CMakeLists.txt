@@ -13,6 +13,8 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -fsanitize=address,undefined")
 
+find_package(Threads REQUIRED)
+
 # --- Include paths ---
 include_directories(include)
 
@@ -47,7 +49,7 @@ add_library(astra_bench
     src/benchmark/BenchmarkRunner.cpp
 )
 target_include_directories(astra_bench PUBLIC include)
-target_link_libraries(astra_bench PUBLIC astra_core astra_parser astra_feed)
+target_link_libraries(astra_bench PUBLIC astra_core astra_parser astra_feed Threads::Threads)
 
 # --- Main exchange CLI ---
 add_executable(exchange src/main.cpp)
@@ -73,6 +75,24 @@ if(GTest_FOUND)
     )
     target_link_libraries(astra_bench_tests PRIVATE astra_bench GTest::GTest GTest::Main)
     add_test(NAME bench_tests COMMAND astra_bench_tests)
+
+    add_executable(astra_pool_tests
+        tests/test_memory_pool.cpp
+    )
+    target_link_libraries(astra_pool_tests PRIVATE astra_core GTest::GTest GTest::Main)
+    add_test(NAME pool_tests COMMAND astra_pool_tests)
+
+    add_executable(astra_spsc_tests
+        tests/test_spsc.cpp
+    )
+    target_link_libraries(astra_spsc_tests PRIVATE astra_core Threads::Threads GTest::GTest GTest::Main)
+    add_test(NAME spsc_tests COMMAND astra_spsc_tests)
+
+    add_executable(astra_ioc_fok_tests
+        tests/test_ioc_fok.cpp
+    )
+    target_link_libraries(astra_ioc_fok_tests PRIVATE astra_core GTest::GTest GTest::Main)
+    add_test(NAME ioc_fok_tests COMMAND astra_ioc_fok_tests)
 else()
     message(STATUS "GoogleTest not found — tests skipped. Install with: brew install googletest")
 endif()

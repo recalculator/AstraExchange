@@ -33,7 +33,18 @@ EngineResult MatchingEngine::submitOrder(std::shared_ptr<Order> order) {
     auto trades = it->second.addOrder(order);
     tradesGenerated_ += trades.size();
 
-    return {order->status, std::move(trades), ""};
+    // IOC/FOK that resulted in no fill or only partial fill come back with
+    // status CANCELLED. Surface the reason so callers can account for it.
+    std::string reason;
+    if (order->status == OrderStatus::CANCELLED) {
+        if (order->type == OrderType::FOK) {
+            reason = "FOK: insufficient liquidity";
+        } else if (order->type == OrderType::IOC) {
+            reason = "IOC: no fill at limit price";
+        }
+    }
+
+    return {order->status, std::move(trades), reason};
 }
 
 EngineResult MatchingEngine::cancelOrder(const Symbol& symbol, OrderId id) {

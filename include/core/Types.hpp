@@ -15,7 +15,7 @@ using Timestamp = uint64_t; // nanoseconds since epoch
 constexpr Price PRICE_SCALE = 10000;
 
 enum class Side : uint8_t { BUY, SELL };
-enum class OrderType : uint8_t { LIMIT, MARKET, CANCEL };
+enum class OrderType : uint8_t { LIMIT, MARKET, CANCEL, IOC, FOK };
 
 enum class OrderStatus : uint8_t {
     PENDING,

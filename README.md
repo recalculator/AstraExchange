@@ -12,8 +12,13 @@ CSV / CLI / Synthetic Generator
             │
             ▼
       Order Parser
+      (+ IOC/FOK types)
             │
-            ▼
+         [optional]
+    SPSC Ring Buffer
+    (producer thread)
+            │
+            ▼  (consumer thread / same thread in baseline)
      Risk Validator
      (qty, price, symbol, duplicate ID)
             │
@@ -53,8 +58,57 @@ OrderBook        OrderBook
 | `std::map<Price, PriceLevel>` | Ask side — best ask at `begin()` | O(log N) insert/erase |
 | `std::deque<Order>` per level | Time priority within a price level | O(1) front/pop |
 | `std::unordered_map<OrderId, Location>` | O(1) cancel by ID | O(1) avg |
+| `MemoryPool<T>` | Slab allocator for Order objects | O(1) alloc/dealloc |
+| `SpscRingBuffer<T>` | Lock-free SPSC ingestion queue | O(1) push/pop |
 
 **Price representation:** All prices are stored as 64-bit fixed-point integers (×10,000) to eliminate floating-point comparison errors.
+
+---
+
+## Phase 4 features
+
+### 4A — Memory Pool / Slab Allocator (`include/utils/MemoryPool.hpp`)
+
+A fixed-capacity slab allocator for objects of type `T`:
+
+- Pre-allocates `N` raw aligned slots at construction — no per-object `malloc` during the matching hot path.
+- Free-slot tracking via an explicit index-based freelist (`vector<uint32_t>`), avoiding the pointer-overlay approach that requires `sizeof(T) >= sizeof(void*)`.
+- O(1) `alloc` and `dealloc`.
+- Objects are constructed in-place (placement new) and explicitly destroyed on `dealloc`.
+- Not thread-safe — matches the single-threaded engine model.
+
+In benchmark `--pool` mode, each submitted `Order` is pool-allocated and wrapped in a `shared_ptr` with a custom deleter that returns the slot on release. This eliminates the `tcmalloc`/system-allocator round-trip per order.
+
+**Honest result:** At 1M orders, pool mode shows slightly lower throughput than baseline (2.89M vs 3.02M orders/sec). The pool eliminates per-order `malloc`, but the `shared_ptr` with custom deleter still incurs control-block overhead, and the pool's `vector<uint32_t>` freelist is itself heap-managed. The real benefit would come from replacing `shared_ptr<Order>` throughout with raw pool-owned pointers — an invasive change that would require rewriting `PriceLevel` and `OrderBook`. That's a meaningful Phase 5 task, not a one-line swap.
+
+### 4B — Lock-Free SPSC Ring Buffer (`include/utils/SpscRingBuffer.hpp`)
+
+A single-producer/single-consumer ring buffer for the parser-to-engine pipeline:
+
+- Fixed capacity (rounded up to next power-of-two internally).
+- Lock-free: no mutexes. Uses `std::atomic<size_t>` head/tail with explicit acquire/release ordering.
+- Cache-line padded head and tail (`alignas(64)`) to eliminate false sharing between producer and consumer threads.
+- Producer publishes writes with `memory_order_release`; consumer acquires before reading.
+- Full and empty detected by the sentinel-gap pattern: capacity usable slots, one gap slot.
+
+In benchmark `--pipeline` mode, the main thread produces parsed orders and the engine runs on a dedicated consumer thread. A `nullptr` sentinel signals end-of-stream.
+
+**Honest result:** Pipeline mode shows modest improvement at 100K orders (3.97M vs 3.49M baseline) because the producer can batch-feed the queue while the consumer is matching. At 1M orders the gap narrows (2.98M vs 3.02M baseline) — the matching engine is the bottleneck, and distributing it across threads doesn't help if the consumer thread is always the slowest stage.
+
+### 4C — IOC and FOK Order Types
+
+**IOC (Immediate-Or-Cancel):**
+- Matches aggressively against available liquidity at or better than the limit price.
+- Any unfilled remainder is cancelled immediately — never rests in the book.
+- Partial fills are allowed.
+
+**FOK (Fill-Or-Kill):**
+- Before executing, scans available liquidity to verify the full quantity can be filled.
+- If yes: executes in full (may span multiple price levels, respects price-time priority).
+- If no: rejects entirely with no trades and no book modification.
+- Never partially fills. Never rests in the book.
+
+Both types are fully integrated into the CSV parser (`IOC`/`FOK` tokens), the synthetic generator (3% IOC, 2% FOK of the generated stream), the matching engine, and the event log.
 
 ---
 
@@ -66,15 +120,18 @@ OrderBook        OrderBook
 # macOS
 brew install cmake googletest
 
-# Configure and build
+# Configure and build (Release)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
 
 # Executables
-./build/exchange        # CSV replay + interactive mode
-./build/exchange_bench  # Synthetic benchmark runner
-./build/astra_tests     # Unit tests (core engine)
-./build/astra_bench_tests  # Benchmark/generator tests
+./build/exchange             # CSV replay + interactive mode
+./build/exchange_bench       # Synthetic benchmark runner
+./build/astra_tests          # Core engine unit tests (21)
+./build/astra_bench_tests    # Benchmark/generator tests (16)
+./build/astra_pool_tests     # MemoryPool tests (9)
+./build/astra_spsc_tests     # SpscRingBuffer tests (8)
+./build/astra_ioc_fok_tests  # IOC/FOK tests (17)
 ```
 
 ---
@@ -91,123 +148,94 @@ CSV format:
 ```
 timestamp,order_id,symbol,side,type,price,quantity
 1,1001,AAPL,BUY,LIMIT,150.25,100
-2,1002,AAPL,SELL,LIMIT,150.20,50
-3,1003,AAPL,BUY,MARKET,0,40
-4,1004,AAPL,BUY,LIMIT,1001,CANCEL,0,1
+2,1002,AAPL,SELL,MARKET,0,50
+3,1003,AAPL,BUY,IOC,150.00,40
+4,1004,AAPL,SELL,FOK,149.00,30
+5,1005,AAPL,BUY,LIMIT,1005,CANCEL,0,1
 ```
 
-Flags:
-- `--trades` — print each trade as it executes
-- `--book` — print the order book after each trade
-- `--verbose` — print rejected orders
-- `--symbols AAPL,MSFT,...` — registered symbols (default: AAPL,MSFT,NVDA,TSLA)
-
-### Interactive mode
-
-```bash
-./build/exchange --interactive
-# Then type CSV lines, QUIT to exit
-```
+Supported types: `LIMIT`, `MARKET`, `CANCEL`, `IOC`, `FOK`
 
 ### Benchmark
 
 ```bash
-# 100K orders
-./build/exchange_bench --orders 100000
+# Baseline single-threaded
+./build/exchange_bench --orders 1000000
 
-# 1M orders, 4 symbols
-./build/exchange_bench --orders 1000000 --symbols 4
+# Memory pool allocator (single-threaded)
+./build/exchange_bench --orders 1000000 --pool
 
-# 10M orders, no invariant check, no CSV
+# Lock-free SPSC pipeline (2 threads)
+./build/exchange_bench --orders 1000000 --pipeline
+
+# Skip invariant checks for raw speed
 ./build/exchange_bench --orders 10000000 --no-verify --no-csv
 
-# Reproducible with custom seed
+# Custom seed for reproducibility
 ./build/exchange_bench --orders 1000000 --seed 123
-```
 
-Benchmark results are appended to `benchmark-results.csv` by default.
+# Custom ring buffer size (pipeline only, must be power of 2)
+./build/exchange_bench --orders 1000000 --pipeline --ring-size 32768
+```
 
 ---
 
 ## Running tests
 
 ```bash
-./build/astra_tests         # 21 unit tests
-./build/astra_bench_tests   # 16 benchmark/generator tests
+./build/astra_tests          # 21 core engine tests
+./build/astra_bench_tests    # 16 benchmark/generator tests
+./build/astra_pool_tests     # 9 MemoryPool tests
+./build/astra_spsc_tests     # 8 SPSC ring buffer tests (incl. 1M item MT test)
+./build/astra_ioc_fok_tests  # 17 IOC/FOK correctness tests
 ```
 
-All 37 tests pass.
+**Total: 71 tests, all passing.**
 
 ### What is tested
 
-**Core engine (21 tests):**
-- Limit buy rests when no ask exists
-- Limit sell rests when no bid exists
-- Buy crosses ask, sell crosses bid
-- Partial fill, full fill, multiple fills
-- Price priority (best price matches first)
-- Time priority (earliest order at same price matches first)
-- Cancellation removes orders from the book
-- Cancelled orders cannot trade
-- Market orders sweep available liquidity
-- Invalid cancels return false
-- Book invariants hold after every operation
-- Engine rejects: unknown symbol, duplicate ID, zero quantity
-- Multi-symbol isolation
+**Core engine (21 tests):** limit resting, bid/ask crossing, partial/full/multiple fills, price priority, time priority, cancellation, cancelled-cannot-trade, market orders, invalid cancels, book invariants, engine rejections (unknown symbol, duplicate ID, zero qty), multi-symbol isolation.
 
-**Benchmark / generator (16 tests):**
-- Generator produces exact requested count
-- All order types present in generated stream
-- Invalid orders rejected by engine (not silently dropped)
-- Trades generated across realistic mixed workload
-- Multi-symbol isolation under generated traffic
-- Cancelled orders cannot trade after removal
-- Invariant checker catches duplicate IDs
-- Invariant checker catches zero-qty trades
-- Invariant checker catches zero-price trades
-- Full 10K benchmark run passes all invariants
+**Benchmark/generator (16 tests):** generator count, order type mix, invalid rejection, real matches produced, multi-symbol isolation under load, cancelled-cannot-trade, invariant checker (duplicate IDs, zero-qty trades, zero-price trades), full small-run invariant pass.
+
+**MemoryPool (9 tests):** alloc/dealloc, fill to capacity, exhaustion throws `bad_alloc`, slot reuse after dealloc, pointer uniqueness, non-trivial type (string) construction/destruction, alloc/free round-trip stress, available-decreases-on-alloc, null dealloc is no-op.
+
+**SpscRingBuffer (8 tests):** push/pop single item, empty pop returns nullopt, FIFO order, full buffer rejects push, capacity is power-of-two, move-only type, multi-threaded 1M-item producer/consumer with FIFO verification, sentinel-pattern end-of-stream.
+
+**IOC/FOK (17 tests):** IOC full fill, IOC partial fill + cancel remainder, IOC no liquidity cancels, IOC never rests, IOC sell side, IOC price-time priority; FOK full fill, FOK insufficient liquidity rejected with no book modification, FOK never partially fills, FOK never rests, FOK multi-level fill, FOK sell side, FOK price-time priority, FOK fail leaves invariants intact; engine IOC routing, engine FOK routing, FOK fail returns reason string.
 
 ---
 
 ## Benchmark results
 
-Measured on Apple M3 Pro, macOS 14, clang 15, `-O3`, single-threaded.
+Measured on **Apple M3 Pro, macOS 14, clang 15, `-O3`**, seed=42.
+Order mix: 55% LIMIT · 20% MARKET · 15% CANCEL · 3% IOC · 2% FOK · 5% INVALID.
 
 ### 100,000 orders (4 symbols)
 
-```
-Orders submitted:    100,000
-Orders accepted:      86,068
-Orders rejected:      13,932
-Cancels processed:     5,002
-Trades generated:     59,811
-Throughput:         3.82 M orders/sec
-p50 latency:           0.17 μs
-p95 latency:           0.50 μs
-p99 latency:           1.04 μs
-Max latency:         479.67 μs
-Memory (RSS):          35.6 MB
-Invariants:             PASS
-```
+| Mode | Throughput | p50 | p99 | Max | Memory |
+|------|-----------|-----|-----|-----|--------|
+| Baseline (single-thread) | 3.49 M/sec | 0.17 μs | 1.00 μs | 428 μs | 34.5 MB |
+| Pool (single-thread) | 3.13 M/sec | 0.17 μs | 1.00 μs | 332 μs | 36.4 MB |
+| Pipeline (SPSC, 2 threads) | 3.97 M/sec | 0.12 μs | 0.83 μs | 260 μs | 34.0 MB |
 
 ### 1,000,000 orders (4 symbols)
 
-```
-Orders submitted:  1,000,000
-Orders accepted:     850,964
-Orders rejected:     149,036
-Cancels processed:    49,845
-Trades generated:    599,380
-Throughput:         2.87 M orders/sec
-p50 latency:           0.17 μs
-p95 latency:           0.83 μs
-p99 latency:           1.83 μs
-Max latency:        4567.12 μs
-Memory (RSS):         286.8 MB
-Invariants:             PASS
-```
+| Mode | Throughput | p50 | p99 | Max | Memory |
+|------|-----------|-----|-----|-----|--------|
+| Baseline (single-thread) | 3.02 M/sec | 0.17 μs | 1.58 μs | 4,116 μs | 284.8 MB |
+| Pool (single-thread) | 2.89 M/sec | 0.17 μs | 1.29 μs | 5,355 μs | 307.1 MB |
+| Pipeline (SPSC, 2 threads) | 2.98 M/sec | 0.17 μs | 1.46 μs | 3,739 μs | 285.7 MB |
 
-**Observation:** Throughput decreases slightly at 1M vs 100K due to memory pressure (large deques, index growth). Max latency outliers are driven by occasional deep multi-level sweeps, not typical cases.
+All three modes produce identical trade counts and pass all correctness invariants.
+
+**Honest interpretation of the numbers:**
+
+- **Pool mode** is not faster than baseline. The current architecture uses `shared_ptr<Order>` throughout `PriceLevel` and `OrderBook`. Wrapping a pool-allocated `Order` in a `shared_ptr` with a custom deleter still pays for control-block allocation and atomic ref-counting. The pool removes the per-`Order` `malloc`, but the `shared_ptr` overhead dominates. A meaningful improvement would require replacing `shared_ptr` with raw pool-owned pointers inside the book — an invasive architectural change.
+
+- **Pipeline mode** improves p50/p99 latency at 100K orders by overlapping parsing with matching. At 1M orders the benefit diminishes because the engine (consumer thread) is the throughput bottleneck — adding a producer thread doesn't help when the consumer can't keep up.
+
+- **Max latency** in all modes is dominated by occasional market orders sweeping many price levels, not allocator behavior.
 
 ---
 
@@ -215,10 +243,12 @@ Invariants:             PASS
 
 | Type | Fraction | Notes |
 |------|----------|-------|
-| Limit orders | 60% | 30% are aggressive (crossing) to generate trades |
+| Limit orders | 55% | ~30% are aggressive (crossing) to generate trades |
 | Market orders | 20% | Sweep available liquidity |
 | Cancels | 15% | Target randomly sampled resting orders |
-| Invalid | 5% | Zero qty, zero price, unknown symbol — all rejected |
+| IOC | 3% | Aggressive limit price; remainder cancelled if not fully filled |
+| FOK | 2% | Moderate qty; rejected entirely if full qty not available |
+| Invalid | 5% | Zero qty, zero price, unknown symbol — all rejected by validator |
 
 ---
 
@@ -232,22 +262,27 @@ Invariants:             PASS
 6. **All trades have positive price and non-zero quantity**
 7. **Cancelled orders cannot match** subsequent incoming orders
 8. **Book index is consistent** with resting orders (internal check)
+9. **IOC/FOK orders never rest** in the book after processing
 
 ---
 
 ## Honest limitations
 
-- **Single-threaded.** The matching engine runs on one thread per process. This is intentional — deterministic order processing guarantees correctness. Multi-threaded ingestion (Phase 4) would require lock-free queues between parser and engine.
+- **Pool mode is not faster than baseline in this architecture.** The root cause is `shared_ptr` ownership throughout the book internals. Fixing this requires replacing `shared_ptr<Order>` in `PriceLevel`/`OrderBook` with raw pointers owned by the pool — that's the next meaningful allocator optimization.
 
-- **Memory is not pooled.** Orders are heap-allocated via `std::shared_ptr`. A memory pool or arena allocator (Phase 4) would reduce latency variance and improve cache locality.
+- **Pipeline mode provides limited throughput gain.** The matching engine is single-threaded per design (deterministic ordering requires it). The SPSC queue overlaps parsing with matching but can't parallelize the matching itself. The benefit is real at small workloads (14% improvement at 100K) but marginal at 1M+ orders.
 
-- **std::map is not the fastest structure.** A real HFT system would use a flat array indexed by price tick offset. `std::map` gives O(log N) per price level lookup; a tick-indexed array gives O(1) but requires bounded price ranges.
+- **No MPMC queue.** Only one producer and one consumer are supported. Multi-symbol parallelism (one engine thread per symbol) would require a more complex routing layer.
 
-- **Max latency outliers are real.** The 4.5 ms max at 1M orders reflects occasional deep multi-level sweeps (a market order consuming many price levels). p99 at 1.83 μs is the more representative tail figure.
+- **No MODIFY order type.** Cancelling and re-submitting is the only way to change a resting order.
 
-- **This is not a network exchange.** There is no TCP stack, session layer, or FIX protocol. Orders are submitted in-process.
+- **std::map is not the fastest price-level structure.** A tick-indexed flat array would give O(1) best-bid/ask lookup, but requires bounded price ranges. The `std::map` gives O(log N) and works for arbitrary prices.
 
-- **Benchmark hardware matters.** These numbers are from a laptop. A server with L3 cache tuning, CPU pinning, and NUMA awareness would show different characteristics.
+- **Max latency outliers are real.** The multi-millisecond max values are genuine — they occur when a market or aggressive limit order sweeps many price levels in one call, not allocator variance.
+
+- **This is not a network exchange.** No TCP stack, FIX protocol, session layer, or wire format. Orders are submitted in-process.
+
+- **Not production software.** There is no fault tolerance, persistence, regulatory reporting, or operational tooling. The engine is correct and measurably fast for a C++ portfolio project — nothing more.
 
 ---
 
@@ -257,40 +292,36 @@ Invariants:             PASS
 AstraExchange/
 ├── include/
 │   ├── core/
-│   │   ├── Types.hpp          # Fixed-point price, OrderId, Timestamp typedefs
-│   │   ├── Order.hpp          # Order struct
-│   │   ├── Trade.hpp          # Trade struct
-│   │   ├── PriceLevel.hpp     # deque<Order> at one price point
-│   │   ├── OrderBook.hpp      # bid/ask maps + index + matching
-│   │   ├── MatchingEngine.hpp # multi-symbol dispatcher
-│   │   └── RiskValidator.hpp  # pre-trade checks
+│   │   ├── Types.hpp           # Fixed-point price, OrderId, OrderType (LIMIT/MARKET/CANCEL/IOC/FOK)
+│   │   ├── Order.hpp           # Order struct
+│   │   ├── Trade.hpp           # Trade struct
+│   │   ├── PriceLevel.hpp      # deque<Order> at one price point
+│   │   ├── OrderBook.hpp       # bid/ask maps + index + matching (LIMIT/MARKET/IOC/FOK)
+│   │   ├── MatchingEngine.hpp  # multi-symbol dispatcher
+│   │   └── RiskValidator.hpp   # pre-trade checks
 │   ├── parser/
-│   │   └── CsvParser.hpp
+│   │   └── CsvParser.hpp       # parses LIMIT/MARKET/CANCEL/IOC/FOK
 │   ├── feed/
-│   │   ├── EventLog.hpp       # pluggable event sink
-│   │   └── MarketDataFeed.hpp # terminal book display
+│   │   ├── EventLog.hpp
+│   │   └── MarketDataFeed.hpp
+│   ├── utils/
+│   │   ├── MemoryPool.hpp      # slab allocator (Phase 4A)
+│   │   └── SpscRingBuffer.hpp  # lock-free SPSC queue (Phase 4B)
 │   └── benchmark/
-│       ├── LatencyTimer.hpp   # high-res timer + p50/p95/p99/max
-│       ├── OrderGenerator.hpp # synthetic workload generator
+│       ├── LatencyTimer.hpp
+│       ├── OrderGenerator.hpp  # generates LIMIT/MARKET/CANCEL/IOC/FOK/INVALID
 │       ├── InvariantChecker.hpp
-│       ├── BenchmarkRunner.hpp
+│       ├── BenchmarkRunner.hpp # Baseline / Pool / Pipeline modes
 │       └── ReplayEngine.hpp
-├── src/                       # implementations mirror include/
+├── src/
 ├── tests/
-│   ├── test_orderbook.cpp     # 21 core engine tests
-│   └── test_benchmark.cpp     # 16 generator/benchmark tests
+│   ├── test_orderbook.cpp      # 21 core engine tests
+│   ├── test_benchmark.cpp      # 16 benchmark/generator tests
+│   ├── test_memory_pool.cpp    # 9 MemoryPool tests
+│   ├── test_spsc.cpp           # 8 SPSC ring buffer tests
+│   └── test_ioc_fok.cpp        # 17 IOC/FOK tests
 ├── data/
 │   └── sample_orders.csv
-├── benchmark-results.csv      # auto-generated after bench runs
+├── benchmark-results.csv
 └── CMakeLists.txt
 ```
-
----
-
-## Planned (Phase 4)
-
-- Memory pool / slab allocator for `Order` objects
-- Lock-free ring buffer between parser thread and engine thread
-- Fill-or-kill and immediate-or-cancel order types
-- Modify order support
-- Tick-indexed price level array (O(1) best bid/ask)
